@@ -1,0 +1,390 @@
+"use strict";
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+const http_1 = __importDefault(require("http"));
+const mqtt_1 = __importDefault(require("mqtt"));
+const logger_1 = require("./logger");
+const streamingDelegate_1 = require("./streamingDelegate");
+const version = require('../package.json').version;
+let hap;
+let Accessory;
+const PLUGIN_NAME = 'homebridge-camera-ffmpeg';
+const PLATFORM_NAME = 'Camera-ffmpeg';
+class FfmpegPlatform {
+    constructor(log, config, api) {
+        var _a;
+        this.cameraConfigs = new Map();
+        this.cachedAccessories = [];
+        this.accessories = [];
+        this.motionTimers = new Map();
+        this.doorbellTimers = new Map();
+        this.mqttActions = new Map();
+        this.log = new logger_1.Logger(log);
+        this.api = api;
+        this.config = config;
+        (_a = this.config.cameras) === null || _a === void 0 ? void 0 : _a.forEach((cameraConfig) => {
+            let error = false;
+            if (!cameraConfig.name) {
+                this.log.error('One of your cameras has no name configured. This camera will be skipped.');
+                error = true;
+            }
+            if (!cameraConfig.videoConfig) {
+                this.log.error('The videoConfig section is missing from the config. This camera will be skipped.', cameraConfig.name);
+                error = true;
+            }
+            else {
+                if (!cameraConfig.videoConfig.source) {
+                    this.log.error('There is no source configured for this camera. This camera will be skipped.', cameraConfig.name);
+                    error = true;
+                }
+                else {
+                    const sourceArgs = cameraConfig.videoConfig.source.split(/\s+/);
+                    if (!sourceArgs.includes('-i')) {
+                        this.log.warn('The source for this camera is missing "-i", it is likely misconfigured.', cameraConfig.name);
+                    }
+                }
+                if (cameraConfig.videoConfig.stillImageSource) {
+                    const stillArgs = cameraConfig.videoConfig.stillImageSource.split(/\s+/);
+                    if (!stillArgs.includes('-i')) {
+                        this.log.warn('The stillImageSource for this camera is missing "-i", it is likely misconfigured.', cameraConfig.name);
+                    }
+                }
+                if (cameraConfig.videoConfig.vcodec === 'copy' && cameraConfig.videoConfig.videoFilter) {
+                    this.log.warn('A videoFilter is defined, but the copy vcodec is being used. This will be ignored.', cameraConfig.name);
+                }
+            }
+            if (!error) {
+                const uuid = hap.uuid.generate(cameraConfig.name);
+                if (this.cameraConfigs.has(uuid)) {
+                    this.log.warn('Multiple cameras are configured with this name. Duplicate cameras will be skipped.', cameraConfig.name);
+                }
+                else {
+                    this.cameraConfigs.set(uuid, cameraConfig);
+                }
+            }
+        });
+        api.on("didFinishLaunching", this.didFinishLaunching.bind(this));
+    }
+    addMqttAction(topic, message, details) {
+        const messageMap = this.mqttActions.get(topic) || new Map();
+        const actionArray = messageMap.get(message) || [];
+        actionArray.push(details);
+        messageMap.set(message, actionArray);
+        this.mqttActions.set(topic, messageMap);
+    }
+    setupAccessory(accessory, cameraConfig) {
+        accessory.on("identify", () => {
+            this.log.info('Identify requested.', accessory.displayName);
+        });
+        const accInfo = accessory.getService(hap.Service.AccessoryInformation);
+        if (accInfo) {
+            accInfo.setCharacteristic(hap.Characteristic.Manufacturer, cameraConfig.manufacturer || 'Homebridge');
+            accInfo.setCharacteristic(hap.Characteristic.Model, cameraConfig.model || 'Camera FFmpeg');
+            accInfo.setCharacteristic(hap.Characteristic.SerialNumber, cameraConfig.serialNumber || 'SerialNumber');
+            accInfo.setCharacteristic(hap.Characteristic.FirmwareRevision, cameraConfig.firmwareRevision || version);
+        }
+        const motionSensor = accessory.getService(hap.Service.MotionSensor);
+        const doorbell = accessory.getService(hap.Service.Doorbell);
+        const doorbellTrigger = accessory.getServiceById(hap.Service.Switch, 'DoorbellTrigger');
+        const motionTrigger = accessory.getServiceById(hap.Service.Switch, 'MotionTrigger');
+        const doorbellSwitch = accessory.getServiceById(hap.Service.StatelessProgrammableSwitch, 'DoorbellSwitch');
+        const speaker = accessory.getService(hap.Service.Speaker);
+        const microphone = accessory.getService(hap.Service.Microphone);
+        if (motionSensor) {
+            accessory.removeService(motionSensor);
+        }
+        if (doorbell) {
+            accessory.removeService(doorbell);
+        }
+        if (doorbellTrigger) {
+            accessory.removeService(doorbellTrigger);
+        }
+        if (motionTrigger) {
+            accessory.removeService(motionTrigger);
+        }
+        if (doorbellSwitch) {
+            accessory.removeService(doorbellSwitch);
+        }
+        if (cameraConfig.doorbell) {
+            const doorbell = new hap.Service.Doorbell(cameraConfig.name + ' Doorbell');
+            accessory.addService(doorbell);
+            const speaker = new hap.Service.Speaker(cameraConfig.name + ' Speaker', 'speaker');
+            const microphone = new hap.Service.Microphone(cameraConfig.name + ' Microphone', 'Microphone');
+            if (cameraConfig.switches) {
+                const doorbellTrigger = new hap.Service.Switch(cameraConfig.name + ' Doorbell Trigger', 'DoorbellTrigger');
+                doorbellTrigger
+                    .getCharacteristic(hap.Characteristic.On)
+                    .on("set", (state, callback) => {
+                    this.doorbellHandler(accessory, state);
+                    callback();
+                });
+                accessory.addService(doorbellTrigger);
+            }
+        }
+        if (cameraConfig.motion) {
+            const motionSensor = new hap.Service.MotionSensor(cameraConfig.name);
+            accessory.addService(motionSensor);
+            if (cameraConfig.switches) {
+                const motionTrigger = new hap.Service.Switch(cameraConfig.name + ' Motion Trigger', 'MotionTrigger');
+                motionTrigger
+                    .getCharacteristic(hap.Characteristic.On)
+                    .on("set", (state, callback) => {
+                    this.motionHandler(accessory, state, 1);
+                    callback();
+                });
+                accessory.addService(motionTrigger);
+            }
+        }
+        const delegate = new streamingDelegate_1.StreamingDelegate(this.log, cameraConfig, this.api, hap, this.config.videoProcessor);
+        accessory.configureController(delegate.controller);
+        if (this.config.mqtt) {
+            if (cameraConfig.mqtt) {
+                if (cameraConfig.mqtt.motionTopic) {
+                    this.addMqttAction(cameraConfig.mqtt.motionTopic, cameraConfig.mqtt.motionMessage || cameraConfig.name, { accessory: accessory, active: true, doorbell: false });
+                }
+                if (cameraConfig.mqtt.motionResetTopic) {
+                    this.addMqttAction(cameraConfig.mqtt.motionResetTopic, cameraConfig.mqtt.motionResetMessage || cameraConfig.name, { accessory: accessory, active: false, doorbell: false });
+                }
+                if (cameraConfig.mqtt.doorbellTopic) {
+                    this.addMqttAction(cameraConfig.mqtt.doorbellTopic, cameraConfig.mqtt.doorbellMessage || cameraConfig.name, { accessory: accessory, active: true, doorbell: true });
+                }
+            }
+        }
+    }
+    configureAccessory(accessory) {
+        this.log.info('Configuring cached bridged accessory...', accessory.displayName);
+        const cameraConfig = this.cameraConfigs.get(accessory.UUID);
+        if (cameraConfig) {
+            this.setupAccessory(accessory, cameraConfig);
+        }
+        this.cachedAccessories.push(accessory);
+    }
+    doorbellHandler(accessory, active = true) {
+        var _a;
+        const doorbell = accessory.getService(hap.Service.Doorbell);
+        if (doorbell) {
+            this.log.debug('Switch doorbell ' + (active ? 'on.' : 'off.'), accessory.displayName);
+            const timeout = this.doorbellTimers.get(accessory.UUID);
+            if (timeout) {
+                clearTimeout(timeout);
+                this.doorbellTimers.delete(accessory.UUID);
+            }
+            const doorbellTrigger = accessory.getServiceById(hap.Service.Switch, 'DoorbellTrigger');
+            if (active) {
+                doorbell.updateCharacteristic(hap.Characteristic.ProgrammableSwitchEvent, hap.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS);
+                if (doorbellTrigger) {
+                    doorbellTrigger.updateCharacteristic(hap.Characteristic.On, true);
+                    let timeoutConfig = (_a = this.cameraConfigs.get(accessory.UUID)) === null || _a === void 0 ? void 0 : _a.motionTimeout;
+                    timeoutConfig = timeoutConfig && timeoutConfig > 0 ? timeoutConfig : 1;
+                    const timer = setTimeout(() => {
+                        this.log.debug('Doorbell handler timeout.', accessory.displayName);
+                        this.doorbellTimers.delete(accessory.UUID);
+                        doorbellTrigger.updateCharacteristic(hap.Characteristic.On, false);
+                    }, timeoutConfig * 1000);
+                    this.doorbellTimers.set(accessory.UUID, timer);
+                }
+                return {
+                    error: false,
+                    message: 'Doorbell switched on.'
+                };
+            }
+            else {
+                if (doorbellTrigger) {
+                    doorbellTrigger.updateCharacteristic(hap.Characteristic.On, false);
+                }
+                return {
+                    error: false,
+                    message: 'Doorbell switched off.'
+                };
+            }
+        }
+        else {
+            return {
+                error: true,
+                message: 'Doorbell is not enabled for this camera.'
+            };
+        }
+    }
+    motionHandler(accessory, active = true, minimumTimeout = 0) {
+        var _a;
+        const motionSensor = accessory.getService(hap.Service.MotionSensor);
+        if (motionSensor) {
+            this.log.debug('Switch motion detect ' + (active ? 'on.' : 'off.'), accessory.displayName);
+            const timeout = this.motionTimers.get(accessory.UUID);
+            if (timeout) {
+                clearTimeout(timeout);
+                this.motionTimers.delete(accessory.UUID);
+            }
+            const motionTrigger = accessory.getServiceById(hap.Service.Switch, 'MotionTrigger');
+            const config = this.cameraConfigs.get(accessory.UUID);
+            if (active) {
+                motionSensor.updateCharacteristic(hap.Characteristic.MotionDetected, true);
+                if (motionTrigger) {
+                    motionTrigger.updateCharacteristic(hap.Characteristic.On, true);
+                }
+                if (config === null || config === void 0 ? void 0 : config.motionDoorbell) {
+                    this.doorbellHandler(accessory, true);
+                }
+                let timeoutConfig = (_a = config === null || config === void 0 ? void 0 : config.motionTimeout) !== null && _a !== void 0 ? _a : 1;
+                if (timeoutConfig < minimumTimeout) {
+                    timeoutConfig = minimumTimeout;
+                }
+                if (timeoutConfig > 0) {
+                    const timer = setTimeout(() => {
+                        this.log.debug('Motion handler timeout.', accessory.displayName);
+                        this.motionTimers.delete(accessory.UUID);
+                        motionSensor.updateCharacteristic(hap.Characteristic.MotionDetected, false);
+                        if (motionTrigger) {
+                            motionTrigger.updateCharacteristic(hap.Characteristic.On, false);
+                        }
+                    }, timeoutConfig * 1000);
+                    this.motionTimers.set(accessory.UUID, timer);
+                }
+                return {
+                    error: false,
+                    message: 'Motion switched on.',
+                    cooldownActive: !!timeout
+                };
+            }
+            else {
+                motionSensor.updateCharacteristic(hap.Characteristic.MotionDetected, false);
+                if (motionTrigger) {
+                    motionTrigger.updateCharacteristic(hap.Characteristic.On, false);
+                }
+                if (config === null || config === void 0 ? void 0 : config.motionDoorbell) {
+                    this.doorbellHandler(accessory, false);
+                }
+                return {
+                    error: false,
+                    message: 'Motion switched off.'
+                };
+            }
+        }
+        else {
+            return {
+                error: true,
+                message: 'Motion is not enabled for this camera.'
+            };
+        }
+    }
+    httpHandler(fullpath, name) {
+        const accessory = this.accessories.find((curAcc) => {
+            return curAcc.displayName == name;
+        });
+        if (accessory) {
+            const path = fullpath.split('/').filter((value) => value.length > 0);
+            switch (path[0]) {
+                case 'motion':
+                    return this.motionHandler(accessory, path[1] != 'reset');
+                    break;
+                case 'doorbell':
+                    return this.doorbellHandler(accessory);
+                    break;
+                default:
+                    return {
+                        error: true,
+                        message: 'First directory level must be "motion" or "doorbell", got "' + path[0] + '".'
+                    };
+            }
+        }
+        else {
+            return {
+                error: true,
+                message: 'Camera "' + name + '" not found.'
+            };
+        }
+    }
+    didFinishLaunching() {
+        for (const [uuid, cameraConfig] of this.cameraConfigs) {
+            if (cameraConfig.unbridge) {
+                const accessory = new Accessory(cameraConfig.name, uuid);
+                this.log.info('Configuring unbridged accessory...', accessory.displayName);
+                this.setupAccessory(accessory, cameraConfig);
+                this.api.publishExternalAccessories(PLUGIN_NAME, [accessory]);
+                this.accessories.push(accessory);
+            }
+            else {
+                const cachedAccessory = this.cachedAccessories.find((curAcc) => curAcc.UUID === uuid);
+                if (!cachedAccessory) {
+                    const accessory = new Accessory(cameraConfig.name, uuid);
+                    this.log.info('Configuring bridged accessory...', accessory.displayName);
+                    this.setupAccessory(accessory, cameraConfig);
+                    this.api.registerPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+                    this.accessories.push(accessory);
+                }
+                else {
+                    this.accessories.push(cachedAccessory);
+                }
+            }
+        }
+        if (this.config.mqtt) {
+            const portmqtt = this.config.portmqtt || '1883';
+            this.log.info('Setting up MQTT connection...');
+            const client = mqtt_1.default.connect((this.config.tlsmqtt ? 'mqtts://' : 'mqtt://') + this.config.mqtt + ':' + portmqtt, {
+                'username': this.config.usermqtt,
+                'password': this.config.passmqtt
+            });
+            client.on('connect', () => {
+                this.log.info('MQTT connected.');
+                for (const [topic] of this.mqttActions) {
+                    this.log.debug('Subscribing to MQTT topic: ' + topic);
+                    client.subscribe(topic);
+                }
+            });
+            client.on('message', (topic, message) => {
+                const messageMap = this.mqttActions.get(topic);
+                if (messageMap) {
+                    const actionArray = messageMap.get(message.toString());
+                    if (actionArray) {
+                        for (const action of actionArray) {
+                            if (action.doorbell) {
+                                this.doorbellHandler(action.accessory, action.active);
+                            }
+                            else {
+                                this.motionHandler(action.accessory, action.active);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        if (this.config.porthttp) {
+            console.log('Setting up ' + (this.config.localhttp ? 'localhost-only ' : '') +
+                'HTTP server on port ' + this.config.porthttp + '...');
+            const server = http_1.default.createServer();
+            const hostname = this.config.localhttp ? 'localhost' : undefined;
+            server.listen(this.config.porthttp, hostname);
+            server.on('request', (request, response) => {
+                let results = {
+                    error: true,
+                    message: 'Malformed URL.'
+                };
+                console.log("----------request.url" + request.url);
+                if (request.url) {
+                    const spliturl = request.url.split('?');
+                    if (spliturl.length == 2) {
+                        const name = decodeURIComponent(spliturl[1]).split('=')[0];
+                        results = this.httpHandler(spliturl[0], name);
+                    }
+                }
+                response.writeHead(results.error ? 500 : 200);
+                response.write(JSON.stringify(results));
+                response.end();
+            });
+        }
+        this.cachedAccessories.forEach((accessory) => {
+            const cameraConfig = this.cameraConfigs.get(accessory.UUID);
+            if (!cameraConfig || cameraConfig.unbridge) {
+                this.log.info('Removing bridged accessory...', accessory.displayName);
+                this.api.unregisterPlatformAccessories(PLUGIN_NAME, PLATFORM_NAME, [accessory]);
+            }
+        });
+    }
+}
+module.exports = (api) => {
+    hap = api.hap;
+    Accessory = api.platformAccessory;
+    api.registerPlatform(PLUGIN_NAME, PLATFORM_NAME, FfmpegPlatform);
+};
+//# sourceMappingURL=index.js.map
