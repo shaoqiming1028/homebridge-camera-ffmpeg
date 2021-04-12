@@ -119,6 +119,10 @@ class FfmpegPlatform implements DynamicPlatformPlugin {
     const motionTrigger = accessory.getServiceById(hap.Service.Switch, 'MotionTrigger');
     const doorbellSwitch = accessory.getServiceById(hap.Service.StatelessProgrammableSwitch, 'DoorbellSwitch');
 
+    const speaker = accessory.getService(hap.Service.Speaker);
+    const microphone = accessory.getService(hap.Service.Microphone);
+
+
     if (motionSensor) {
       accessory.removeService(motionSensor);
     }
@@ -134,10 +138,22 @@ class FfmpegPlatform implements DynamicPlatformPlugin {
     if (doorbellSwitch) {
       accessory.removeService(doorbellSwitch);
     }
+    // if (speaker) {
+    //   accessory.removeService(speaker);
+    // }
+    // if (microphone) {
+    //   accessory.removeService(microphone);
+    // }
 
     if (cameraConfig.doorbell) {
       const doorbell = new hap.Service.Doorbell(cameraConfig.name + ' Doorbell');
       accessory.addService(doorbell);
+
+
+      const speaker = new hap.Service.Speaker(cameraConfig.name + ' Speaker', 'speaker');
+      const microphone = new hap.Service.Microphone(cameraConfig.name + ' Microphone', 'Microphone');
+
+
       if (cameraConfig.switches) {
         const doorbellTrigger = new hap.Service.Switch(cameraConfig.name + ' Doorbell Trigger', 'DoorbellTrigger');
         doorbellTrigger
@@ -383,7 +399,7 @@ class FfmpegPlatform implements DynamicPlatformPlugin {
       });
     }
     if (this.config.porthttp) {
-      this.log.info('Setting up ' + (this.config.localhttp ? 'localhost-only ' : '') +
+      console.log('Setting up ' + (this.config.localhttp ? 'localhost-only ' : '') +
         'HTTP server on port ' + this.config.porthttp + '...');
       const server = http.createServer();
       const hostname = this.config.localhttp ? 'localhost' : undefined;
@@ -393,6 +409,7 @@ class FfmpegPlatform implements DynamicPlatformPlugin {
           error: true,
           message: 'Malformed URL.'
         };
+        console.log("----------request.url" + request.url)
         if (request.url) {
           const spliturl = request.url.split('?');
           if (spliturl.length == 2) {
